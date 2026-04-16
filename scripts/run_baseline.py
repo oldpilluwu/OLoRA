@@ -20,7 +20,13 @@ import argparse
 from pathlib import Path
 
 from olora.runtime import run_baseline
-from olora.settings import DEFAULT_BATCH_SIZE, DEFAULT_MAX_LENGTH, DEFAULT_TRAIN_STEPS
+from olora.settings import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MAX_LENGTH,
+    DEFAULT_SEED,
+    DEFAULT_TRAIN_STEPS,
+    DEFAULT_WARMUP_STEPS,
+)
 
 
 def main() -> None:
@@ -40,6 +46,8 @@ def main() -> None:
     parser.add_argument("--train-steps", type=int, default=DEFAULT_TRAIN_STEPS)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     parser.add_argument("--output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--run-name", type=str, default=None)
     args = parser.parse_args()
@@ -50,6 +58,8 @@ def main() -> None:
         train_steps=args.train_steps,
         batch_size=args.batch_size,
         max_length=args.max_length,
+        seed=args.seed,
+        warmup_steps=args.warmup_steps,
         output_dir=args.output_dir,
         run_name=args.run_name,
     )

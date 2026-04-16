@@ -38,9 +38,10 @@ RUNS_DIR = PROJECT_ROOT / "runs"
 DEFAULT_MODEL_ID = "distilgpt2"       # HuggingFace model ID to download
 DEFAULT_MAX_LENGTH = 128              # Max token sequence length per sample
 DEFAULT_BATCH_SIZE = 2                # Samples per batch per adapter job
-DEFAULT_TRAIN_STEPS = 16              # Number of training steps per job
+DEFAULT_TRAIN_STEPS = 16              # Number of measured training steps per job
 DEFAULT_LR = 2e-4                     # AdamW learning rate for LoRA parameters
 DEFAULT_SEED = 42                     # Random seed for reproducibility
+DEFAULT_WARMUP_STEPS = 2              # Steps run before timing/recording starts
 
 
 @dataclass(frozen=True, slots=True)

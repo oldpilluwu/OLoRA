@@ -19,7 +19,9 @@ in how batches are fed and when optimizers step.
 
 from __future__ import annotations
 
+import gc
 import json
+import logging
 import random
 import subprocess
 import time
@@ -40,9 +42,44 @@ from olora.settings import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_SEED,
     DEFAULT_TRAIN_STEPS,
+    DEFAULT_WARMUP_STEPS,
     MODEL_DIR,
     RUNS_DIR,
 )
+
+
+LOGGER = logging.getLogger("olora.runtime")
+if not LOGGER.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    LOGGER.addHandler(handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
+
+
+def _cuda_sync() -> None:
+    """Block until all queued CUDA work has completed. No-op on CPU.
+
+    Required before/after timing measurements: PyTorch CUDA kernels are
+    asynchronous, so perf_counter() around forward/backward only measures
+    kernel launch time unless we sync.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _release_torch_memory() -> None:
+    """Best-effort release of Python refs and CUDA cached blocks."""
+    gc.collect()
+    if torch.cuda.is_available():
+        _cuda_sync()
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            try:
+                torch.cuda.ipc_collect()
+            except RuntimeError:
+                # IPC collection can fail harmlessly if CUDA context state changed.
+                pass
 
 
 # ===========================================================================
@@ -84,7 +121,11 @@ def load_base_model(local_model_dir: Path = MODEL_DIR) -> tuple[AutoTokenizer, A
     return tokenizer, model
 
 
-def prepare_multi_adapter_model(model: AutoModelForCausalLM, adapter_names: list[str]) -> RoutedCausalLM:
+def prepare_multi_adapter_model(
+    model: AutoModelForCausalLM,
+    adapter_names: list[str],
+    lora_config: RoutedLoraConfig | None = None,
+) -> RoutedCausalLM:
     """
     Wrap the base HuggingFace model with routed LoRA adapters.
 
@@ -102,7 +143,7 @@ def prepare_multi_adapter_model(model: AutoModelForCausalLM, adapter_names: list
         base_model=model,
         adapter_names=adapter_names,
         target_modules=["c_attn", "c_proj", "c_fc"],  # GPT-2 specific layer names
-        config=RoutedLoraConfig(rank=8, alpha=16.0, dropout=0.05),
+        config=lora_config or RoutedLoraConfig(rank=8, alpha=16.0, dropout=0.05),
     )
 
 
@@ -180,6 +221,57 @@ def gpu_snapshot() -> dict[str, float] | None:
 # Loss decomposition for fused batches
 # ===========================================================================
 
+def per_adapter_loss_tensors(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    adapter_ids: torch.Tensor,
+    adapter_names: tuple[str, ...],
+) -> dict[str, torch.Tensor]:
+    """
+    Compute per-adapter mean cross-entropy losses as differentiable tensors.
+
+    This is the primitive used both for training (sum these and backward) and
+    for logging (call .item() on each tensor).
+
+    The summed-mean formulation is what makes fused multi-adapter training
+    gradient-equivalent to standalone training: since adapter i's LoRA
+    parameters only receive gradients from adapter i's samples, normalizing
+    each per-adapter term by its own token count (T_i) gives each adapter the
+    same effective gradient magnitude it would see training alone -- instead
+    of the T_i / T_total dilution you get from a single mean-over-all-tokens
+    loss.
+
+    Returns:
+      Dict mapping adapter_name -> scalar tensor (mean CE over that adapter's
+      valid tokens). Adapters absent from the batch, or with zero valid tokens,
+      are omitted.
+    """
+    # For causal LM loss, we shift: predict token t+1 from position t.
+    shifted_logits = logits[..., :-1, :].contiguous()
+    shifted_labels = labels[..., 1:].contiguous()
+
+    # Per-token CE loss (no reduction -- we need individual token losses).
+    token_losses = F.cross_entropy(
+        shifted_logits.view(-1, shifted_logits.shape[-1]),
+        shifted_labels.view(-1),
+        reduction="none",
+        ignore_index=-100,
+    ).view(shifted_labels.shape)
+
+    valid_mask = shifted_labels.ne(-100)
+
+    losses: dict[str, torch.Tensor] = {}
+    for adapter_index, adapter_name in enumerate(adapter_names):
+        sample_mask = adapter_ids == adapter_index
+        if not bool(sample_mask.any()):
+            continue
+        adapter_valid = valid_mask[sample_mask]
+        if int(adapter_valid.sum().item()) == 0:
+            continue
+        losses[adapter_name] = token_losses[sample_mask][adapter_valid].mean()
+    return losses
+
+
 def per_adapter_losses(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -187,51 +279,17 @@ def per_adapter_losses(
     adapter_names: tuple[str, ...],
 ) -> dict[str, float]:
     """
-    Break down the loss from a fused batch into per-adapter losses.
-
-    In the fixed_set_simultaneous baseline, a single batch contains samples from
-    multiple adapters. This function computes the average loss for each adapter
-    separately, so we can track how well each individual job is learning.
-
-    Args:
-      logits       -- Model output logits [batch_size, seq_len, vocab_size]
-      labels       -- Ground truth labels [batch_size, seq_len] (-100 for ignored positions)
-      adapter_ids  -- [batch_size] tensor saying which adapter each sample belongs to
-      adapter_names -- Tuple of adapter names, indexed to match adapter_ids values
+    Float version of per_adapter_loss_tensors for logging.
 
     Returns:
       Dict like {"ag_news": 5.38, "emotion": 7.74} with mean loss per adapter.
     """
-    # For causal LM loss, we shift: predict token t+1 from position t.
-    shifted_logits = logits[..., :-1, :].contiguous()
-    shifted_labels = labels[..., 1:].contiguous()
-
-    # Compute per-token loss (no reduction -- we need individual token losses).
-    token_losses = F.cross_entropy(
-        shifted_logits.view(-1, shifted_logits.shape[-1]),
-        shifted_labels.view(-1),
-        reduction="none",         # Don't average yet -- we need per-token values
-        ignore_index=-100,        # Skip padding and prompt tokens
-    ).view(shifted_labels.shape)
-
-    # Mask of which positions have real labels (not -100).
-    valid_mask = shifted_labels.ne(-100)
-
-    # For each adapter, average the losses over just that adapter's valid tokens.
-    losses: dict[str, float] = {}
-    for adapter_index, adapter_name in enumerate(adapter_names):
-        # Which samples in the batch belong to this adapter?
-        sample_mask = adapter_ids == adapter_index
-        if not bool(sample_mask.any()):
-            continue
-        # Which tokens in those samples are real (not padding/prompt)?
-        adapter_valid = valid_mask[sample_mask]
-        if int(adapter_valid.sum().item()) == 0:
-            continue
-        # Average loss over this adapter's valid tokens.
-        adapter_loss = token_losses[sample_mask][adapter_valid].mean().item()
-        losses[adapter_name] = float(adapter_loss)
-    return losses
+    return {
+        name: float(tensor.item())
+        for name, tensor in per_adapter_loss_tensors(
+            logits.detach(), labels, adapter_ids, adapter_names
+        ).items()
+    }
 
 
 # ===========================================================================
@@ -397,15 +455,20 @@ class BaselineRunner:
         max_length: int = DEFAULT_MAX_LENGTH,
         learning_rate: float = DEFAULT_LR,
         seed: int = DEFAULT_SEED,
+        warmup_steps: int = DEFAULT_WARMUP_STEPS,
         output_dir: Path = RUNS_DIR,
         run_name: str | None = None,
     ) -> None:
         self.job_specs = job_specs          # What jobs to train
-        self.train_steps = train_steps      # Steps per job
+        self.train_steps = train_steps      # Measured (recorded) steps per job
         self.batch_size = batch_size        # Samples per batch per job
         self.max_length = max_length        # Max tokens per sample
         self.learning_rate = learning_rate  # AdamW LR for LoRA params
         self.seed = seed
+        # Steps run before the timer starts and before any record/counter update.
+        # Pays one-time CUDA JIT/compile/cache costs so the first measured step
+        # is steady-state instead of dominated by warmup.
+        self.warmup_steps = max(0, warmup_steps)
         self.output_dir = output_dir        # Where to write the result JSON
         self.run_name = run_name            # Optional custom filename for the output
 
@@ -416,8 +479,13 @@ class BaselineRunner:
         self.device = pick_device()
 
         # Load the pre-trained model from local disk and wrap with LoRA.
+        self.lora_config = RoutedLoraConfig(rank=8, alpha=16.0, dropout=0.05)
         self.tokenizer, base_model = load_base_model()
-        self.model = prepare_multi_adapter_model(base_model, [spec.name for spec in job_specs])
+        self.model = prepare_multi_adapter_model(
+            base_model,
+            [spec.name for spec in job_specs],
+            lora_config=self.lora_config,
+        )
         self.model.to(self.device)
         self.model.train()  # Put in training mode (enables dropout, etc.)
 
@@ -427,6 +495,65 @@ class BaselineRunner:
         # Wall-clock timing for the current run (set when a run method starts).
         self.run_start_time = 0.0
         self.last_run_wall_time_sec = 0.0
+
+    def release_resources(self) -> None:
+        """Drop references so one baseline run does not pin GPU memory for the next."""
+        for job in self.jobs.values():
+            job.train_iterator = None
+            job.train_loader = None
+            job.eval_loader = None
+            job.optimizer = None
+        self.jobs.clear()
+        self.model = None
+        self.tokenizer = None
+        _release_torch_memory()
+
+    def _log_run_header(self, baseline_name: str) -> None:
+        """Emit a concise configuration summary at the start of each measured run."""
+        LOGGER.info(
+            "Starting baseline=%s device=%s jobs=%d seed=%d train_steps=%d warmup_steps=%d "
+            "batch_size=%d max_length=%d lr=%.6f lora_rank=%d lora_alpha=%.1f lora_dropout=%.2f",
+            baseline_name,
+            self.device,
+            len(self.job_specs),
+            self.seed,
+            self.train_steps,
+            self.warmup_steps,
+            self.batch_size,
+            self.max_length,
+            self.learning_rate,
+            self.lora_config.rank,
+            self.lora_config.alpha,
+            self.lora_config.dropout,
+        )
+        job_summary = ", ".join(f"{spec.name}={spec.dataset_key}" for spec in self.job_specs)
+        LOGGER.info("Jobs: %s", job_summary)
+
+    def _log_job_start(self, baseline_name: str, job: AdapterJob, index: int, total_jobs: int) -> None:
+        """Emit a job-level progress line for baselines that process jobs individually."""
+        LOGGER.info(
+            "Running baseline=%s job=%d/%d name=%s dataset=%s steps=%d",
+            baseline_name,
+            index,
+            total_jobs,
+            job.name,
+            job.dataset_key,
+            self.train_steps,
+        )
+
+    def _log_run_footer(self, baseline_name: str, output_path: Path, summary: dict[str, object]) -> None:
+        """Emit a short run summary after results have been written."""
+        tokens_per_sec = summary.get("aggregate_tokens_per_sec")
+        wall_time = summary.get("total_wall_time_sec")
+        mean_jct = summary.get("mean_jct_sec")
+        peak_gpu_memory = summary.get("peak_gpu_memory_mb")
+        log_line = (
+            f"Finished baseline={baseline_name} wall_time_sec={wall_time:.3f} "
+            f"tokens_per_sec={tokens_per_sec:.3f} mean_jct_sec={mean_jct:.3f}"
+        )
+        if peak_gpu_memory is not None:
+            log_line += f" peak_gpu_memory_mb={peak_gpu_memory:.1f}"
+        LOGGER.info("%s output=%s", log_line, output_path)
 
     def _build_jobs(self, job_specs: list[JobSpec]) -> dict[str, AdapterJob]:
         """
@@ -438,13 +565,17 @@ class BaselineRunner:
           - An iterator over the training data
         """
         jobs = {}
-        for spec in job_specs:
+        for offset, spec in enumerate(job_specs):
+            # Per-job seed offset: every job gets a deterministic but distinct
+            # shuffle order so that two jobs reading the same dataset don't
+            # train on identical batches in the same step.
             train_loader = build_dataloader(
                 spec.dataset_key,
                 "train",
                 tokenizer=self.tokenizer,
                 batch_size=self.batch_size,
                 max_length=self.max_length,
+                seed=self.seed + offset,
             )
             eval_loader = build_dataloader(
                 spec.dataset_key,
@@ -452,6 +583,7 @@ class BaselineRunner:
                 tokenizer=self.tokenizer,
                 batch_size=self.batch_size,
                 max_length=self.max_length,
+                seed=self.seed + offset,
             )
             # Look up this adapter's integer index in the RoutedCausalLM.
             adapter_index = self.model.adapter_index[spec.name]
@@ -481,6 +613,43 @@ class BaselineRunner:
     def _run_elapsed(self) -> float:
         """Seconds elapsed since this run started (from self.run_start_time)."""
         return time.perf_counter() - self.run_start_time
+
+    def _warmup(self, baseline: str) -> None:
+        """
+        Run self.warmup_steps un-recorded steps to absorb one-time CUDA costs.
+
+        Warmup steps DO update model weights and DO advance the dataloader
+        (otherwise the very first measured step still pays the JIT cost).
+        Counters that feed JCT/throughput summaries are saved and restored so
+        that the measured run reports exactly self.train_steps per job.
+        """
+        if self.warmup_steps <= 0:
+            return
+
+        jobs = list(self.jobs.values())
+        # Snapshot per-job counters so warmup is invisible to summary metrics.
+        snapshot = [(job.steps_completed, job.tokens_seen, job.completion_time_sec) for job in jobs]
+
+        if baseline == "sequential" or baseline == "time_sliced":
+            # Round-robin warmup steps across jobs so every adapter's LoRA
+            # path is exercised at least once before timing begins.
+            for warmup_step in range(self.warmup_steps * len(jobs)):
+                self._step_job(jobs[warmup_step % len(jobs)])
+        elif baseline == "fixed_set_simultaneous":
+            for _ in range(self.warmup_steps):
+                self._fused_step(jobs)
+        else:
+            raise ValueError(f"Unknown baseline for warmup: {baseline}")
+
+        # Restore counters so the measured run starts from a clean slate.
+        for job, (steps, tokens, completion) in zip(jobs, snapshot):
+            job.steps_completed = steps
+            job.tokens_seen = tokens
+            job.completion_time_sec = completion
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+        _cuda_sync()
 
     def _mark_job_completion(self, job: AdapterJob) -> None:
         """
@@ -550,7 +719,42 @@ class BaselineRunner:
             summary["mean_gpu_memory_used_mb"] = sum(gpu_memory_used) / len(gpu_memory_used)
             summary["max_gpu_memory_used_mb"] = max(gpu_memory_used)
 
+        peak_records = [float(record["peak_gpu_memory_mb"]) for record in records if "peak_gpu_memory_mb" in record]
+        if peak_records:
+            summary["peak_gpu_memory_mb"] = max(peak_records)
+
+        summary["training_loss_per_job"] = self._training_loss_per_job(step_records)
+
         return summary
+
+    def _training_loss_per_job(self, step_records: list[dict[str, float]]) -> dict[str, dict[str, float]]:
+        """Aggregate training losses per job so runs can be compared for convergence."""
+        per_job_losses: dict[str, list[float]] = {spec.name: [] for spec in self.job_specs}
+
+        for record in step_records:
+            if "job" in record and "loss" in record:
+                per_job_losses.setdefault(str(record["job"]), []).append(float(record["loss"]))
+                continue
+            for spec in self.job_specs:
+                loss_key = f"loss_{spec.name}"
+                if loss_key in record:
+                    per_job_losses.setdefault(spec.name, []).append(float(record[loss_key]))
+
+        summaries: dict[str, dict[str, float]] = {}
+        dataset_by_name = {spec.name: spec.dataset_key for spec in self.job_specs}
+        for job_name, losses in per_job_losses.items():
+            if not losses:
+                continue
+            summaries[job_name] = {
+                "dataset_key": dataset_by_name.get(job_name, ""),
+                "num_records": len(losses),
+                "initial_loss": losses[0],
+                "final_loss": losses[-1],
+                "mean_loss": sum(losses) / len(losses),
+                "min_loss": min(losses),
+                "max_loss": max(losses),
+            }
+        return summaries
 
     # -----------------------------------------------------------------------
     # Single training step (used by sequential and time_sliced baselines)
@@ -583,7 +787,9 @@ class BaselineRunner:
         batch["adapter_ids"] = build_adapter_ids(batch, job.adapter_index)
         batch = move_batch_to_device(batch, self.device)
 
-        # Forward + backward.
+        # Forward + backward. Sync first so step_time excludes work queued
+        # by previous steps; sync after to include this step's GPU work.
+        _cuda_sync()
         step_start = time.perf_counter()
         outputs = self.model(**batch)
         loss = outputs.loss
@@ -592,6 +798,7 @@ class BaselineRunner:
         if step_optimizer:
             job.optimizer.step()
 
+        _cuda_sync()
         step_time = time.perf_counter() - step_start
 
         # Update job counters.
@@ -691,6 +898,7 @@ class BaselineRunner:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         output_stem = self.run_name or baseline_name
         output_path = self.output_dir / f"{output_stem}.json"
+        summary = self._summary_from_records(baseline_name, records)
         payload = {
             "baseline": baseline_name,
             "device": str(self.device),
@@ -699,16 +907,76 @@ class BaselineRunner:
             "train_steps": self.train_steps,
             "batch_size": self.batch_size,
             "max_length": self.max_length,
+            "learning_rate": self.learning_rate,
+            "seed": self.seed,
+            "warmup_steps": self.warmup_steps,
+            "lora": {
+                "rank": self.lora_config.rank,
+                "alpha": self.lora_config.alpha,
+                "dropout": self.lora_config.dropout,
+            },
             "metrics": records,
-            "summary": self._summary_from_records(baseline_name, records),
+            "summary": summary,
             "evaluation": self._evaluate_all(),
         }
         output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._log_run_footer(baseline_name, output_path, summary)
         return output_path
 
     # ===================================================================
     # BASELINE 1: Sequential
     # ===================================================================
+
+    def _fused_step(self, jobs: list[AdapterJob]) -> dict[str, object]:
+        """
+        Execute one fused multi-adapter training step.
+
+        Returns a dict with the fields needed to build a step record. Used by
+        both warmup (record discarded) and the measured loop.
+        """
+        for job in jobs:
+            job.optimizer.zero_grad(set_to_none=True)
+
+        fused_batch, per_job_tokens, per_job_samples = self._build_fused_batch(jobs)
+        macro_tokens = sum(per_job_tokens.values())
+        fused_batch = move_batch_to_device(fused_batch, self.device)
+
+        _cuda_sync()
+        macro_start = time.perf_counter()
+        outputs = self.model(**fused_batch)
+
+        # Use sum of per-adapter mean losses as the training objective, NOT
+        # the HF mean-over-all-tokens loss. The single-mean form dilutes each
+        # adapter's gradient by T_i / T_total relative to standalone training;
+        # the sum-of-means form keeps each adapter's gradient magnitude equal
+        # to what it would see training alone on its own sub-batch. Gradient
+        # isolation (adapter i only gets grads from adapter i's samples) is
+        # still handled by the routing masks in RoutedLoRAConv1D.
+        adapter_loss_tensors = per_adapter_loss_tensors(
+            outputs.logits,
+            fused_batch["labels"],
+            fused_batch["adapter_ids"],
+            self.model.adapter_names,
+        )
+        training_loss = sum(adapter_loss_tensors.values())
+        training_loss.backward()
+        for job in jobs:
+            job.optimizer.step()
+        _cuda_sync()
+        macro_time = time.perf_counter() - macro_start
+
+        adapter_losses = {
+            name: float(tensor.item()) for name, tensor in adapter_loss_tensors.items()
+        }
+
+        return {
+            "loss": float(training_loss.item()),
+            "macro_tokens": macro_tokens,
+            "macro_time": macro_time,
+            "per_job_tokens": per_job_tokens,
+            "per_job_samples": per_job_samples,
+            "adapter_losses": adapter_losses,
+        }
 
     def run_sequential(self) -> Path:
         """
@@ -723,11 +991,14 @@ class BaselineRunner:
         for its entire training. Good JCT for early jobs, bad for later ones.
         """
         records = []
-        self.run_start_time = time.perf_counter()
+        self._warmup("sequential")
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_run_header("sequential")
+        self.run_start_time = time.perf_counter()
 
-        for job in self.jobs.values():
+        for index, job in enumerate(self.jobs.values(), start=1):
+            self._log_job_start("sequential", job, index, len(self.jobs))
             for local_step in range(self.train_steps):
                 metrics = self._step_job(job)
                 records.append(
@@ -768,9 +1039,11 @@ class BaselineRunner:
         jobs = list(self.jobs.values())
         # Total steps = steps_per_job * number_of_jobs.
         total_steps = self.train_steps * len(jobs)
-        self.run_start_time = time.perf_counter()
+        self._warmup("time_sliced")
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_run_header("time_sliced")
+        self.run_start_time = time.perf_counter()
 
         for global_step in range(total_steps):
             # Round-robin: cycle through jobs.
@@ -815,76 +1088,55 @@ class BaselineRunner:
           2. Build a fused batch (concatenate one batch from each job)
           3. ONE forward pass through the model (RoutedLoRAConv1D routes each
              sample to its adapter's LoRA weights)
-          4. ONE backward pass (gradients flow to each adapter's A/B matrices
+          4. Compute a per-adapter mean loss for each adapter, and sum them
+             into the training loss. This is crucial for correctness: a single
+             mean-over-all-tokens loss would dilute each adapter's gradient by
+             T_i / T_total. Summing per-adapter means gives each adapter the
+             same effective gradient as standalone training.
+          5. ONE backward pass (gradients flow to each adapter's A/B matrices
              only from their own samples, thanks to the routing masks)
-          5. Step each job's optimizer (applies the accumulated gradients)
+          6. Step each job's optimizer (applies the accumulated gradients)
         """
         records = []
         jobs = list(self.jobs.values())
-        self.run_start_time = time.perf_counter()
+        self._warmup("fixed_set_simultaneous")
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_run_header("fixed_set_simultaneous")
+        self.run_start_time = time.perf_counter()
 
         for fused_step in range(self.train_steps):
-            # Step 1: Zero gradients for all adapters.
-            for job in jobs:
-                job.optimizer.zero_grad(set_to_none=True)
+            step = self._fused_step(jobs)
+            macro_tokens = step["macro_tokens"]
+            macro_time = step["macro_time"]
+            per_job_tokens = step["per_job_tokens"]
+            per_job_samples = step["per_job_samples"]
+            adapter_losses = step["adapter_losses"]
 
-            # Step 2: Build one big batch with samples from all jobs.
-            fused_batch, per_job_tokens, per_job_samples = self._build_fused_batch(jobs)
-            macro_tokens = sum(per_job_tokens.values())  # Total labeled tokens across all jobs
-            fused_batch = move_batch_to_device(fused_batch, self.device)
-
-            # Steps 3-4: ONE forward + ONE backward for the entire fused batch.
-            macro_start = time.perf_counter()
-            outputs = self.model(**fused_batch)
-            loss = outputs.loss
-            loss.backward()
-
-            # Step 5: Each job's optimizer steps (updates only that adapter's LoRA params).
-            for job in jobs:
-                job.optimizer.step()
-
-            macro_time = time.perf_counter() - macro_start
-
-            # Compute per-adapter loss breakdown for logging.
-            adapter_losses = per_adapter_losses(
-                outputs.logits.detach(),
-                fused_batch["labels"],
-                fused_batch["adapter_ids"],
-                self.model.adapter_names,
-            )
-
-            # Update job counters.
             for job in jobs:
                 job.steps_completed += 1
                 job.tokens_seen += int(per_job_tokens[job.name])
                 self._mark_job_completion(job)
 
-            # Build the step record with all metrics.
             record = {
                 "global_step": fused_step + 1,
                 "baseline": "fixed_set_simultaneous",
                 "active_jobs": len(jobs),
-                "mean_loss": float(loss.item()),           # Combined loss across all adapters
-                "tokens": macro_tokens,                     # Total tokens this step
+                "mean_loss": step["loss"],
+                "tokens": macro_tokens,
                 "step_time_sec": macro_time,
                 "tokens_per_sec": float(macro_tokens / macro_time) if macro_time > 0 else 0.0,
             }
-            # Add per-job breakdowns.
             for job_name, token_count in per_job_tokens.items():
                 record[f"tokens_{job_name}"] = token_count
             for job_name, sample_count in per_job_samples.items():
                 record[f"samples_{job_name}"] = sample_count
             for job_name, adapter_loss in adapter_losses.items():
                 record[f"loss_{job_name}"] = adapter_loss
-            # Add GPU snapshot if available.
             snapshot = gpu_snapshot()
             if snapshot is not None:
                 record.update(snapshot)
-            records.append(
-                record
-            )
+            records.append(record)
 
         self.last_run_wall_time_sec = self._run_elapsed()
         peak_memory = self._memory_snapshot_mb()
@@ -903,6 +1155,8 @@ def run_baseline(
     train_steps: int = DEFAULT_TRAIN_STEPS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_length: int = DEFAULT_MAX_LENGTH,
+    seed: int = DEFAULT_SEED,
+    warmup_steps: int = DEFAULT_WARMUP_STEPS,
     output_dir: Path = RUNS_DIR,
     run_name: str | None = None,
 ) -> Path:
@@ -928,13 +1182,18 @@ def run_baseline(
         train_steps=train_steps,
         batch_size=batch_size,
         max_length=max_length,
+        seed=seed,
+        warmup_steps=warmup_steps,
         output_dir=output_dir,
         run_name=run_name,
     )
-    if baseline == "sequential":
-        return runner.run_sequential()
-    if baseline == "time_sliced":
-        return runner.run_time_sliced()
-    if baseline == "fixed_set_simultaneous":
-        return runner.run_fixed_set_simultaneous()
-    raise ValueError(f"Unsupported baseline '{baseline}'.")
+    try:
+        if baseline == "sequential":
+            return runner.run_sequential()
+        if baseline == "time_sliced":
+            return runner.run_time_sliced()
+        if baseline == "fixed_set_simultaneous":
+            return runner.run_fixed_set_simultaneous()
+        raise ValueError(f"Unsupported baseline '{baseline}'.")
+    finally:
+        runner.release_resources()

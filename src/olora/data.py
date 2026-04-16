@@ -158,6 +158,7 @@ def build_dataloader(
     tokenizer: PreTrainedTokenizerBase,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_length: int = DEFAULT_MAX_LENGTH,
+    seed: int | None = None,
 ) -> DataLoader:
     """
     Build a ready-to-iterate DataLoader for one dataset split.
@@ -172,12 +173,20 @@ def build_dataloader(
     Returns a DataLoader that yields dicts with keys:
       input_ids [batch_size, seq_len], attention_mask [batch_size, seq_len], labels [batch_size, seq_len]
     """
+    import torch
+
     dataset_dict = load_local_dataset_dict(dataset_key)
     hf_dataset = dataset_dict[split]
     prompt_dataset = PromptDataset(list(hf_dataset), dataset_key=dataset_key, tokenizer=tokenizer, max_length=max_length)
+    # A per-loader Generator makes shuffle order deterministic given the seed
+    # and isolated from the global torch RNG (which other code may consume).
+    generator = torch.Generator()
+    if seed is not None:
+        generator.manual_seed(seed)
     return DataLoader(
         prompt_dataset,
         batch_size=batch_size,
         shuffle=(split == "train"),        # Shuffle training data, keep validation deterministic
         collate_fn=BatchCollator(tokenizer),  # Custom padding logic
+        generator=generator,
     )

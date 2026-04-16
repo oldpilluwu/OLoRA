@@ -1,38 +1,24 @@
 """
-run_experiment_family2.py -- Sweep across job counts to measure scaling behavior.
+run_experiment_family2.py -- Hardened sweep across job counts and seeds.
 
-This script implements "Experiment Family 2" from the plan: it runs all three
-baselines at multiple job counts (e.g. 2, 4, 8 simultaneous adapter jobs) and
-collects the results into summary files.
-
-The key question this experiment answers:
-  "How does throughput, JCT, and GPU utilization change as we add more
-   concurrent adapter jobs?"
-
-Since we only have 2 real datasets (ag_news, emotion), this script creates
-MULTIPLE adapter jobs that REUSE the same datasets under different names.
-E.g. with job_count=4 and dataset_pool=[ag_news, emotion]:
-  -> job entries: ["ag_news_1=ag_news", "emotion_1=emotion", "ag_news_2=ag_news", "emotion_2=emotion"]
-Each job gets its own independent LoRA adapter, even though two of them train
-on ag_news data and two on emotion data.
-
-Usage:
-  python scripts/run_experiment_family2.py --job-counts 2 4 8 --train-steps 4 --batch-size 1 --max-length 64
+For each job_count x baseline x seed, run one measured training run and
+collect its summary. Then aggregate across seeds (mean / std / N) per
+(job_count, baseline) so headline numbers come with error bars rather
+than as one-shot point estimates.
 
 Output structure:
   runs/family2/
-    2_jobs/
-      job_specs.json              # What jobs were used
-      sequential.json             # Baseline results
-      time_sliced.json
-      fixed_set_simultaneous.json
-    4_jobs/
-      ...
-    8_jobs/
-      ...
-    summary.csv                   # Combined results across all job counts
-    summary.md                    # Markdown table for quick viewing
-    summary.json                  # Machine-readable summary
+    <count>_jobs/
+      job_specs.json
+      seed_<n>/
+        sequential.json
+        time_sliced.json
+        fixed_set_simultaneous.json
+    summary_raw.csv         # one row per seed
+    summary_raw.json
+    summary_agg.csv         # one row per (job_count, baseline) with mean/std
+    summary_agg.md          # human-readable aggregated table
+    summary_agg.json
 """
 
 from __future__ import annotations
@@ -40,79 +26,92 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 
 from olora.runtime import run_baseline
+from olora.settings import DEFAULT_WARMUP_STEPS
 
 
 DEFAULT_BASELINES = ["sequential", "time_sliced", "fixed_set_simultaneous"]
 DEFAULT_JOB_COUNTS = [2, 4, 8]
 DEFAULT_DATASET_POOL = ["ag_news", "emotion"]
+DEFAULT_SEEDS = [42, 43, 44]
+# Hardened defaults: large enough that warmup-corrected timings are
+# above the per-step noise floor on a 6 GB consumer GPU.
+DEFAULT_TRAIN_STEPS = 32
+DEFAULT_BATCH_SIZE = 2
+DEFAULT_MAX_LENGTH = 128
 
 
 def make_job_entries(job_count: int, dataset_pool: list[str]) -> list[str]:
     """
-    Generate job entry strings for a given job count by cycling through the dataset pool.
-
-    Example with job_count=4, dataset_pool=["ag_news", "emotion"]:
-      -> ["ag_news_1=ag_news", "emotion_1=emotion", "ag_news_2=ag_news", "emotion_2=emotion"]
-
-    The "name=dataset_key" format creates distinct adapter names that map back
-    to the same underlying datasets. This lets us simulate many concurrent jobs
-    even with only 2 real datasets.
+    Generate job entry strings by cycling through the dataset pool with
+    distinct adapter names per repeat (e.g. ag_news_1, ag_news_2, ...).
     """
     entries = []
-    # Track how many times each dataset has been used (for naming: ag_news_1, ag_news_2, etc.)
     per_dataset_index = {dataset_key: 0 for dataset_key in dataset_pool}
     for job_index in range(job_count):
-        # Cycle through datasets: ag_news, emotion, ag_news, emotion, ...
         dataset_key = dataset_pool[job_index % len(dataset_pool)]
         per_dataset_index[dataset_key] += 1
-        # E.g. "ag_news_2=ag_news" means adapter named "ag_news_2" using the ag_news dataset.
         entries.append(f"{dataset_key}_{per_dataset_index[dataset_key]}={dataset_key}")
     return entries
 
 
 def load_summary(path: Path) -> dict:
-    """
-    Load a run result JSON and extract its summary block into a flat dict
-    that's easy to tabulate and compare across runs.
-    """
+    """Read one run JSON and flatten its summary into a single dict row."""
     payload = json.loads(path.read_text(encoding="utf-8"))
     summary = payload.get("summary", {}).copy()
-    # Add top-level fields that aren't in the summary block.
     summary["baseline"] = payload.get("baseline")
     summary["device"] = payload.get("device")
     summary["job_count"] = len(payload.get("job_specs", payload.get("dataset_keys", [])))
     summary["train_steps"] = payload.get("train_steps")
     summary["batch_size"] = payload.get("batch_size")
+    summary["max_length"] = payload.get("max_length")
+    summary["seed"] = payload.get("seed")
+    summary["warmup_steps"] = payload.get("warmup_steps")
     summary["run_file"] = str(path)
-    summary["job_specs"] = payload.get("job_specs", [])
     return summary
 
 
-def write_csv(rows: list[dict], output_path: Path) -> None:
-    """Write the summary rows to a CSV file with a fixed set of columns."""
-    fieldnames = [
-        "baseline",
-        "device",
-        "job_count",
-        "train_steps",
-        "batch_size",
-        "total_wall_time_sec",
-        "total_step_time_sec",
-        "aggregate_tokens",
-        "aggregate_tokens_per_sec",
-        "aggregate_steps",
-        "aggregate_steps_per_sec",
-        "mean_jct_sec",
-        "p95_jct_sec",
-        "mean_gpu_utilization_percent",
-        "max_gpu_utilization_percent",
-        "mean_gpu_memory_used_mb",
-        "max_gpu_memory_used_mb",
-        "run_file",
-    ]
+RAW_FIELDS = [
+    "job_count",
+    "baseline",
+    "seed",
+    "device",
+    "train_steps",
+    "batch_size",
+    "max_length",
+    "warmup_steps",
+    "total_wall_time_sec",
+    "total_step_time_sec",
+    "aggregate_tokens",
+    "aggregate_tokens_per_sec",
+    "aggregate_steps",
+    "aggregate_steps_per_sec",
+    "mean_jct_sec",
+    "p95_jct_sec",
+    "mean_gpu_utilization_percent",
+    "max_gpu_utilization_percent",
+    "mean_gpu_memory_used_mb",
+    "max_gpu_memory_used_mb",
+    "run_file",
+]
+
+# Metrics aggregated across seeds (mean / std / n).
+AGG_METRICS = [
+    "total_wall_time_sec",
+    "aggregate_tokens_per_sec",
+    "aggregate_steps_per_sec",
+    "mean_jct_sec",
+    "p95_jct_sec",
+    "mean_gpu_utilization_percent",
+    "mean_gpu_memory_used_mb",
+    "max_gpu_memory_used_mb",
+]
+
+
+def write_csv(rows: list[dict], output_path: Path, fieldnames: list[str]) -> None:
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -120,95 +119,135 @@ def write_csv(rows: list[dict], output_path: Path) -> None:
             writer.writerow({field: row.get(field) for field in fieldnames})
 
 
-def format_value(value: object) -> str:
-    """Format a value for display: floats get 3 decimal places, None becomes '-'."""
-    if value is None:
+def _stats(values: list[float]) -> tuple[float | None, float | None, int]:
+    """Return (mean, sample_std, n) skipping None/NaN. Std is None if n < 2."""
+    clean = [float(v) for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+    n = len(clean)
+    if n == 0:
+        return None, None, 0
+    mean = sum(clean) / n
+    if n < 2:
+        return mean, None, n
+    variance = sum((x - mean) ** 2 for x in clean) / (n - 1)
+    return mean, math.sqrt(variance), n
+
+
+def aggregate(rows: list[dict]) -> list[dict]:
+    """Group raw per-seed rows by (job_count, baseline) and compute mean/std/n."""
+    grouped: dict[tuple[int, str], list[dict]] = {}
+    for row in rows:
+        key = (int(row["job_count"]), str(row["baseline"]))
+        grouped.setdefault(key, []).append(row)
+
+    aggregated: list[dict] = []
+    for (job_count, baseline), group in sorted(grouped.items()):
+        out: dict = {
+            "job_count": job_count,
+            "baseline": baseline,
+            "n_seeds": len(group),
+            "seeds": sorted(int(r["seed"]) for r in group if r.get("seed") is not None),
+        }
+        for metric in AGG_METRICS:
+            mean, std, n = _stats([r.get(metric) for r in group])
+            out[f"{metric}_mean"] = mean
+            out[f"{metric}_std"] = std
+            out[f"{metric}_n"] = n
+        aggregated.append(out)
+    return aggregated
+
+
+def _fmt_mean_std(mean: float | None, std: float | None, decimals: int = 3) -> str:
+    if mean is None:
         return "-"
-    if isinstance(value, float):
-        return f"{value:.3f}"
-    return str(value)
+    if std is None:
+        return f"{mean:.{decimals}f}"
+    return f"{mean:.{decimals}f} ± {std:.{decimals}f}"
 
 
-def render_markdown(rows: list[dict]) -> str:
-    """Render the summary rows as a Markdown table for quick viewing."""
+def render_markdown_agg(rows: list[dict]) -> str:
     columns = [
-        ("job_count", "Jobs"),
-        ("baseline", "Baseline"),
-        ("total_wall_time_sec", "Wall(s)"),
-        ("aggregate_tokens_per_sec", "Tok/s"),
-        ("aggregate_steps_per_sec", "Steps/s"),
-        ("mean_jct_sec", "Mean JCT"),
-        ("p95_jct_sec", "P95 JCT"),
-        ("mean_gpu_utilization_percent", "GPU Util"),
-        ("max_gpu_utilization_percent", "GPU Util Max"),
-        ("mean_gpu_memory_used_mb", "GPU Mem"),
+        ("Jobs", lambda r: str(r["job_count"])),
+        ("Baseline", lambda r: r["baseline"]),
+        ("Seeds", lambda r: str(r["n_seeds"])),
+        ("Wall(s)", lambda r: _fmt_mean_std(r["total_wall_time_sec_mean"], r["total_wall_time_sec_std"])),
+        ("Tok/s", lambda r: _fmt_mean_std(r["aggregate_tokens_per_sec_mean"], r["aggregate_tokens_per_sec_std"])),
+        ("Steps/s", lambda r: _fmt_mean_std(r["aggregate_steps_per_sec_mean"], r["aggregate_steps_per_sec_std"])),
+        ("Mean JCT", lambda r: _fmt_mean_std(r["mean_jct_sec_mean"], r["mean_jct_sec_std"])),
+        ("P95 JCT", lambda r: _fmt_mean_std(r["p95_jct_sec_mean"], r["p95_jct_sec_std"])),
+        ("GPU Util%", lambda r: _fmt_mean_std(r["mean_gpu_utilization_percent_mean"], r["mean_gpu_utilization_percent_std"], decimals=1)),
+        ("GPU Mem MB", lambda r: _fmt_mean_std(r["mean_gpu_memory_used_mb_mean"], r["mean_gpu_memory_used_mb_std"], decimals=0)),
     ]
-    header = "| " + " | ".join(label for _, label in columns) + " |"
+    header = "| " + " | ".join(label for label, _ in columns) + " |"
     separator = "| " + " | ".join("---" for _ in columns) + " |"
     lines = [header, separator]
     for row in rows:
-        line = "| " + " | ".join(format_value(row.get(key)) for key, _ in columns) + " |"
-        lines.append(line)
+        lines.append("| " + " | ".join(getter(row) for _, getter in columns) + " |")
     return "\n".join(lines)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run Experiment Family 2 fixed-set baseline sweeps.")
+    parser = argparse.ArgumentParser(description="Run hardened Family 2 sweep across job counts and seeds.")
     parser.add_argument("--job-counts", nargs="+", type=int, default=DEFAULT_JOB_COUNTS)
     parser.add_argument("--baselines", nargs="+", default=DEFAULT_BASELINES)
     parser.add_argument("--dataset-pool", nargs="+", default=DEFAULT_DATASET_POOL)
-    parser.add_argument("--train-steps", type=int, default=4)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--max-length", type=int, default=64)
+    parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
+    parser.add_argument("--train-steps", type=int, default=DEFAULT_TRAIN_STEPS)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
     parser.add_argument("--output-dir", type=Path, default=Path("runs") / "family2")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    summaries: list[dict] = []
+    raw_rows: list[dict] = []
 
-    # Outer loop: iterate over job counts (e.g. 2, 4, 8).
     for job_count in args.job_counts:
-        # Generate the job entries for this count (e.g. 4 jobs cycling through 2 datasets).
         job_entries = make_job_entries(job_count, args.dataset_pool)
-
-        # Create a subdirectory for this job count.
         job_dir = args.output_dir / f"{job_count}_jobs"
         job_dir.mkdir(parents=True, exist_ok=True)
-        # Save the job specs so we can see what was used.
         (job_dir / "job_specs.json").write_text(json.dumps(job_entries, indent=2), encoding="utf-8")
 
-        # Inner loop: run each baseline with this job count.
-        for baseline in args.baselines:
-            run_name = baseline
-            output_path = run_baseline(
-                baseline=baseline,
-                job_entries=job_entries,
-                train_steps=args.train_steps,
-                batch_size=args.batch_size,
-                max_length=args.max_length,
-                output_dir=job_dir,
-                run_name=run_name,
-            )
-            summaries.append(load_summary(output_path))
+        for seed in args.seeds:
+            seed_dir = job_dir / f"seed_{seed}"
+            seed_dir.mkdir(parents=True, exist_ok=True)
+            for baseline in args.baselines:
+                output_path = run_baseline(
+                    baseline=baseline,
+                    job_entries=job_entries,
+                    train_steps=args.train_steps,
+                    batch_size=args.batch_size,
+                    max_length=args.max_length,
+                    seed=seed,
+                    warmup_steps=args.warmup_steps,
+                    output_dir=seed_dir,
+                    run_name=baseline,
+                )
+                raw_rows.append(load_summary(output_path))
 
-    # Sort by (job_count, baseline) for a clean presentation.
-    summaries.sort(key=lambda row: (int(row["job_count"]), str(row["baseline"])))
+    raw_rows.sort(key=lambda row: (int(row["job_count"]), str(row["baseline"]), int(row["seed"])))
+    aggregated = aggregate(raw_rows)
 
-    # Write combined summary files.
-    csv_path = args.output_dir / "summary.csv"
-    markdown_path = args.output_dir / "summary.md"
-    json_path = args.output_dir / "summary.json"
+    raw_csv = args.output_dir / "summary_raw.csv"
+    raw_json = args.output_dir / "summary_raw.json"
+    agg_csv = args.output_dir / "summary_agg.csv"
+    agg_json = args.output_dir / "summary_agg.json"
+    agg_md = args.output_dir / "summary_agg.md"
 
-    write_csv(summaries, csv_path)
-    markdown_path.write_text(render_markdown(summaries) + "\n", encoding="utf-8")
-    json_path.write_text(json.dumps(summaries, indent=2), encoding="utf-8")
+    write_csv(raw_rows, raw_csv, RAW_FIELDS)
+    raw_json.write_text(json.dumps(raw_rows, indent=2), encoding="utf-8")
 
-    # Print the markdown table to stdout for quick review.
-    print(render_markdown(summaries))
+    agg_fields = ["job_count", "baseline", "n_seeds", "seeds"]
+    for metric in AGG_METRICS:
+        agg_fields += [f"{metric}_mean", f"{metric}_std", f"{metric}_n"]
+    write_csv(aggregated, agg_csv, agg_fields)
+    agg_json.write_text(json.dumps(aggregated, indent=2), encoding="utf-8")
+    agg_md.write_text(render_markdown_agg(aggregated) + "\n", encoding="utf-8")
+
+    print(render_markdown_agg(aggregated))
     print()
-    print(f"CSV: {csv_path}")
-    print(f"Markdown: {markdown_path}")
-    print(f"JSON: {json_path}")
+    print(f"Raw CSV : {raw_csv}")
+    print(f"Agg CSV : {agg_csv}")
+    print(f"Agg MD  : {agg_md}")
 
 
 if __name__ == "__main__":
