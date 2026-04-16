@@ -75,6 +75,7 @@ Run the Experiment Family 2 fixed-set sweep:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\run_experiment_family2.py --job-counts 2 4 8 --train-steps 4 --batch-size 1 --max-length 64
+.\.venv\Scripts\python.exe scripts\run_experiment_family2.py --output-dir runs\family2_hardened
 ```
 
 This writes per-run JSON files plus combined `summary.csv`, `summary.md`, and `summary.json` files under `runs/family2/`.
