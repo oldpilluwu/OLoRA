@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "olora"
+version = "0.1.0"
+description = "Prototype baselines for online LoRA job insertion research."
+requires-python = ">=3.13"
+dependencies = [
+    "accelerate>=1.6.0",
+    "datasets>=3.5.0",
+    "huggingface-hub>=0.30.0",
+    "safetensors>=0.5.3",
+    "torch>=2.7.0",
+    "transformers>=4.51.0",
+    "tqdm>=4.67.1",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
