@@ -83,6 +83,14 @@ Run the Experiment Family 2 fixed-set sweep:
 
 This writes per-run JSON files plus combined `summary.csv`, `summary.md`, and `summary.json` files under `runs/family2/`.
 
+Run the larger Phase C benchmark sweep for a remote GPU server such as an A6000:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_benchmark_phase_c.py --job-counts 2 4 8 12 --train-steps 128 --batch-size 4 --max-length 128
+```
+
+This writes scenario folders plus aggregated benchmark reports under `runs/phase_c_benchmark_a6000/`.
+
 ## Notes
 
 - The `fixed_set_simultaneous` baseline now performs true routed fused-set training: samples from different jobs are concatenated into one batch and routed to their adapter-specific LoRA weights inside the same model forward.
