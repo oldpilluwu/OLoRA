@@ -75,7 +75,7 @@ class RoutedLoraConfig:
     """
     rank: int = 8
     alpha: float = 16.0
-    dropout: float = 0.05
+    dropout: float = 0.00
 
 
 def _set_active_adapter_ids(adapter_ids: torch.Tensor | None) -> torch.Tensor | None:
@@ -119,7 +119,8 @@ class RoutedLoRAConv1D(nn.Module):
         self.base_layer = base_layer
         self.base_layer.requires_grad_(False)
 
-        self.adapter_names = tuple(adapter_names)  # e.g. ("ag_news", "emotion")
+        adapter_names = tuple(adapter_names)
+        self.adapter_names = ()  # Filled via add_adapter() so init and online insertion share one path.
         self.rank = config.rank
         self.scaling = config.alpha / config.rank   # LoRA output is multiplied by this
         self.dropout_p = config.dropout
@@ -136,13 +137,32 @@ class RoutedLoRAConv1D(nn.Module):
         # the adapter starts as a no-op: A @ zeros = zeros).
         self.lora_a = nn.ParameterList()
         self.lora_b = nn.ParameterList()
-        for _ in self.adapter_names:
-            lora_a = nn.Parameter(torch.empty(in_features, self.rank))
-            lora_b = nn.Parameter(torch.zeros(self.rank, out_features))
-            # Kaiming init for A (standard for LoRA).
-            nn.init.kaiming_uniform_(lora_a, a=math.sqrt(5))
-            self.lora_a.append(lora_a)
-            self.lora_b.append(lora_b)
+        for adapter_name in adapter_names:
+            self.add_adapter(adapter_name)
+
+    def _new_adapter_parameters(self) -> tuple[nn.Parameter, nn.Parameter]:
+        """Create one LoRA (A, B) pair on the same device/dtype as the base layer."""
+        device = self.base_layer.weight.device
+        dtype = self.base_layer.weight.dtype
+        lora_a = nn.Parameter(torch.empty(self.in_features, self.rank, device=device, dtype=dtype))
+        lora_b = nn.Parameter(torch.zeros(self.rank, self.out_features, device=device, dtype=dtype))
+        nn.init.kaiming_uniform_(lora_a, a=math.sqrt(5))
+        return lora_a, lora_b
+
+    def add_adapter(self, adapter_name: str) -> int:
+        """
+        Append a brand-new adapter to this routed layer without rebuilding it.
+
+        Returns the integer adapter index assigned to the new adapter.
+        """
+        if adapter_name in self.adapter_names:
+            raise ValueError(f"Adapter '{adapter_name}' already exists in this routed layer.")
+
+        lora_a, lora_b = self._new_adapter_parameters()
+        self.lora_a.append(lora_a)
+        self.lora_b.append(lora_b)
+        self.adapter_names = (*self.adapter_names, adapter_name)
+        return len(self.adapter_names) - 1
 
     def adapter_parameters(self, adapter_index: int) -> list[nn.Parameter]:
         """Return the trainable parameters for one specific adapter."""
@@ -334,6 +354,28 @@ class RoutedCausalLM(nn.Module):
         for routed in self.routed_modules:
             parameters.extend(routed.adapter_parameters(adapter_index))
         return parameters
+
+    def add_adapter(self, adapter_name: str) -> int:
+        """
+        Add a new adapter across all routed layers without restarting the model.
+
+        This is the core primitive Phase C needs for online job insertion:
+        a job can arrive after training has already started, receive freshly
+        initialized LoRA weights, and join subsequent fused steps immediately.
+        """
+        if adapter_name in self.adapter_index:
+            raise ValueError(f"Adapter '{adapter_name}' already exists.")
+
+        adapter_index = len(self.adapter_names)
+        for routed in self.routed_modules:
+            routed.add_adapter(adapter_name)
+
+        self.adapter_names = (*self.adapter_names, adapter_name)
+        self.adapter_index[adapter_name] = adapter_index
+
+        for parameter in self.adapter_parameters(adapter_name):
+            parameter.requires_grad = True
+        return adapter_index
 
     def forward(self, *args, adapter_ids: torch.Tensor | None = None, **kwargs):
         """

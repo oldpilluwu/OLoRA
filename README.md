@@ -9,6 +9,7 @@ This repository now contains the first implementation pass for the scheduler-pap
   - `sequential`
   - `time_sliced`
   - `fixed_set_simultaneous`
+  - `online_insertion`
 
 ## Current prototype choices
 
@@ -16,6 +17,7 @@ This repository now contains the first implementation pass for the scheduler-pap
 - Adapter jobs: `ag_news` and `emotion`
 - Training style: LoRA adapters on a frozen shared base model
 - Fixed-set fused training: one mixed batch, one routed forward/backward, per-sample adapter IDs
+- Online insertion: dynamically add a new adapter job to the active fused set without rebuilding the model
 - Device policy: use CUDA automatically when available, otherwise CPU
 
 `distilgpt2` is intentionally conservative for the first pass so the shared-base multi-adapter runtime stays usable on a 6 GB Windows GPU.
@@ -61,6 +63,7 @@ Example smoke tests:
 .\.venv\Scripts\python.exe scripts\run_baseline.py --baseline sequential --train-steps 1 --batch-size 1 --max-length 64
 .\.venv\Scripts\python.exe scripts\run_baseline.py --baseline time_sliced --train-steps 1 --batch-size 1 --max-length 64
 .\.venv\Scripts\python.exe scripts\run_baseline.py --baseline fixed_set_simultaneous --train-steps 1 --batch-size 1 --max-length 64
+.\.venv\Scripts\python.exe scripts\run_baseline.py --baseline online_insertion --jobs ag_news emotion --initial-job-count 1 --arrival-steps 4 --train-steps 4 --batch-size 1 --max-length 64
 ```
 
 Each run writes a JSON result file into `runs/`.
@@ -83,6 +86,8 @@ This writes per-run JSON files plus combined `summary.csv`, `summary.md`, and `s
 ## Notes
 
 - The `fixed_set_simultaneous` baseline now performs true routed fused-set training: samples from different jobs are concatenated into one batch and routed to their adapter-specific LoRA weights inside the same model forward.
+- The `online_insertion` baseline starts with a smaller active set, creates a new adapter on arrival, warms its dataloader/optimizer, and admits it into the next fused step without restarting the executor.
 - The current metrics include step time, tokens/sec, loss, validation loss, and peak GPU memory when CUDA is available.
+- Online insertion runs also log per-job arrival metadata plus insertion latency and simple disruption metrics in `summary.insertion_events`.
 - The Family 2 sweep can scale beyond the two local datasets by creating multiple distinct adapter jobs that reuse the same downloaded dataset under different adapter names, which is useful for throughput and JCT stress tests on one machine.
-- The next logical step is to add a richer results summary and then implement the online arrival path on top of this shared-base runtime.
+- The next logical step after Phase C is a richer trace-driven experiment driver for staggered arrivals and planner ablations.

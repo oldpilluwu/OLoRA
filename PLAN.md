@@ -145,6 +145,15 @@ Measure:
 * task metric for each adapter
 * convergence curves
 
+Loss interpretation note for `fixed_set_simultaneous`:
+
+* For `sequential` and `time_sliced`, the logged training loss is the usual per-batch mean cross-entropy over valid labeled tokens for one job at a time.
+* For `fixed_set_simultaneous`, the training loss should be computed as the **sum of per-adapter mean losses** within the fused batch, not as one mean over all fused tokens.
+* This matters because a single mean over all tokens would dilute adapter `i`'s gradient by `T_i / T_total` relative to standalone training. Summing per-adapter means preserves the gradient scale each adapter would see if trained alone.
+* Because of that definition, the fused run's raw training loss is **not directly comparable** to the raw training loss from `sequential` or `time_sliced`, and it is also not directly comparable across different active-set sizes such as 2 vs 4 vs 8 jobs.
+* When comparing `fixed_set_simultaneous` against the other two baselines, use per-adapter views instead: per-job final training loss, per-job validation loss, task metrics, and convergence curves normalized per adapter.
+* If a single scalar must be reported for readability, prefer average per-adapter loss across the active set or a token-weighted mean loss over all valid tokens in the fused batch, but keep the summed per-adapter objective as the optimization loss used for backpropagation.
+
 ### Family 2: Fixed-set throughput
 
 Start with 2, then 4, then 8 concurrent adapters, all known in advance.

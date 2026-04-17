@@ -8,6 +8,9 @@ Usage examples:
   # Run the fused baseline with custom settings:
   python scripts/run_baseline.py --baseline fixed_set_simultaneous --train-steps 200 --batch-size 2 --max-length 128
 
+  # Run the online insertion baseline: start one job, insert the second at fused step 4:
+  python scripts/run_baseline.py --baseline online_insertion --jobs ag_news emotion --initial-job-count 1 --arrival-steps 4
+
   # Run with custom adapter job names (useful for scaling experiments):
   python scripts/run_baseline.py --baseline time_sliced --jobs ag1=ag_news ag2=ag_news emotion
 
@@ -34,7 +37,7 @@ def main() -> None:
     parser.add_argument(
         "--baseline",
         required=True,
-        choices=["sequential", "time_sliced", "fixed_set_simultaneous"],
+        choices=["sequential", "time_sliced", "fixed_set_simultaneous", "online_insertion"],
         help="Which baseline to run.",
     )
     parser.add_argument(
@@ -48,6 +51,19 @@ def main() -> None:
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS)
+    parser.add_argument(
+        "--initial-job-count",
+        type=int,
+        default=1,
+        help="For online_insertion, how many jobs start active before any arrivals.",
+    )
+    parser.add_argument(
+        "--arrival-steps",
+        nargs="*",
+        type=int,
+        default=None,
+        help="For online_insertion, 1-based fused step indices when each pending job arrives.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("runs"))
     parser.add_argument("--run-name", type=str, default=None)
     args = parser.parse_args()
@@ -62,6 +78,8 @@ def main() -> None:
         warmup_steps=args.warmup_steps,
         output_dir=args.output_dir,
         run_name=args.run_name,
+        initial_job_count=args.initial_job_count,
+        arrival_steps=args.arrival_steps,
     )
     print(output_path)
 

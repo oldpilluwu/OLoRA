@@ -4,16 +4,18 @@ runtime.py -- Baseline training loops and the runner that orchestrates them.
 This is the main "engine" of the project. It:
   1. Loads the base model and wraps it with routed LoRA adapters
   2. Creates one AdapterJob per dataset (each job has its own dataloader + optimizer)
-  3. Runs one of three baseline training strategies
+  3. Runs baseline training strategies, including online mid-run insertion
   4. Logs per-step metrics and writes results to a JSON file
 
-The three baselines:
+The baselines:
   - SEQUENTIAL:               Train job A to completion, then train job B.
   - TIME_SLICED:              Alternate steps between jobs (round-robin: A, B, A, B, ...).
   - FIXED_SET_SIMULTANEOUS:   Fuse samples from all jobs into ONE batch, do ONE forward
                               pass and ONE backward pass, then step each optimizer.
+  - ONLINE_INSERTION:         Start with a smaller fused active set, then hot-plug new
+                              adapters during the run without rebuilding the executor.
 
-All three use the same underlying RoutedCausalLM model -- the difference is only
+All baselines use the same underlying RoutedCausalLM model -- the difference is only
 in how batches are fed and when optimizers step.
 """
 
@@ -22,6 +24,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import math
 import random
 import subprocess
 import time
@@ -362,6 +365,10 @@ class AdapterJob:
     steps_completed: int = 0
     tokens_seen: int = 0
     completion_time_sec: float | None = None
+    arrival_step: int = 0
+    arrival_time_sec: float = 0.0
+    first_update_step: int | None = None
+    first_update_time_sec: float | None = None
 
     def next_batch(self) -> dict[str, torch.Tensor]:
         """
@@ -394,6 +401,30 @@ class JobSpec:
     """
     name: str
     dataset_key: str
+
+
+@dataclass(slots=True)
+class InsertionEvent:
+    """
+    Metadata for one online adapter admission event.
+
+    The runtime records the request point immediately, then fills in the
+    first-update and slowdown fields after the run when step records exist.
+    """
+    job_name: str
+    dataset_key: str
+    requested_step: int
+    requested_time_sec: float
+    insertion_overhead_sec: float
+    active_jobs_before: int
+    active_jobs_after: int
+    first_update_step: int | None = None
+    first_update_time_sec: float | None = None
+    insertion_to_first_update_sec: float | None = None
+    insertion_to_first_update_steps: int | None = None
+    pre_insert_mean_step_time_sec: float | None = None
+    post_insert_mean_step_time_sec: float | None = None
+    step_time_slowdown_ratio: float | None = None
 
 
 def parse_job_specs(job_entries: list[str]) -> list[JobSpec]:
@@ -440,11 +471,11 @@ def parse_job_specs(job_entries: list[str]) -> list[JobSpec]:
 
 class BaselineRunner:
     """
-    Orchestrates model setup and all three baseline training strategies.
+    Orchestrates model setup and all baseline training strategies.
 
     Lifecycle:
-      1. __init__ loads the model, wraps it with LoRA, builds all AdapterJobs
-      2. Call one of: run_sequential(), run_time_sliced(), run_fixed_set_simultaneous()
+      1. __init__ loads the model, wraps it with LoRA, and builds the initial jobs
+      2. Call one of the baseline methods
       3. The run method trains, evaluates, and writes results JSON to disk
     """
     def __init__(
@@ -458,8 +489,10 @@ class BaselineRunner:
         warmup_steps: int = DEFAULT_WARMUP_STEPS,
         output_dir: Path = RUNS_DIR,
         run_name: str | None = None,
+        initial_job_specs: list[JobSpec] | None = None,
     ) -> None:
         self.job_specs = job_specs          # What jobs to train
+        self.initial_job_specs = initial_job_specs or job_specs
         self.train_steps = train_steps      # Measured (recorded) steps per job
         self.batch_size = batch_size        # Samples per batch per job
         self.max_length = max_length        # Max tokens per sample
@@ -477,20 +510,33 @@ class BaselineRunner:
 
         # Pick CPU or GPU.
         self.device = pick_device()
+        self.job_seed_offsets = {spec.name: offset for offset, spec in enumerate(job_specs)}
+        self.insertion_events: list[InsertionEvent] = []
+
+        initial_names = {spec.name for spec in self.initial_job_specs}
+        unknown_initial = initial_names.difference(spec.name for spec in job_specs)
+        if unknown_initial:
+            unknown_text = ", ".join(sorted(unknown_initial))
+            raise ValueError(f"Initial job specs must be a subset of job_specs, got unknown: {unknown_text}.")
+        if not self.initial_job_specs:
+            raise ValueError("At least one initial job is required to build the shared runtime.")
 
         # Load the pre-trained model from local disk and wrap with LoRA.
-        self.lora_config = RoutedLoraConfig(rank=8, alpha=16.0, dropout=0.05)
+        self.lora_config = RoutedLoraConfig(rank=8, alpha=16.0, dropout=0.0)
         self.tokenizer, base_model = load_base_model()
         self.model = prepare_multi_adapter_model(
             base_model,
-            [spec.name for spec in job_specs],
+            [spec.name for spec in self.initial_job_specs],
             lora_config=self.lora_config,
         )
         self.model.to(self.device)
         self.model.train()  # Put in training mode (enables dropout, etc.)
 
         # Build one AdapterJob per job spec (each with its own dataloader + optimizer).
-        self.jobs = self._build_jobs(job_specs)
+        self.jobs = self._build_jobs(self.initial_job_specs)
+        self.pending_job_specs = {
+            spec.name: spec for spec in job_specs if spec.name not in self.jobs
+        }
 
         # Wall-clock timing for the current run (set when a run method starts).
         self.run_start_time = 0.0
@@ -504,6 +550,8 @@ class BaselineRunner:
             job.eval_loader = None
             job.optimizer = None
         self.jobs.clear()
+        self.pending_job_specs.clear()
+        self.insertion_events.clear()
         self.model = None
         self.tokenizer = None
         _release_torch_memory()
@@ -555,6 +603,44 @@ class BaselineRunner:
             log_line += f" peak_gpu_memory_mb={peak_gpu_memory:.1f}"
         LOGGER.info("%s output=%s", log_line, output_path)
 
+    def _build_job(self, spec: JobSpec, *, arrival_step: int = 0, arrival_time_sec: float = 0.0) -> AdapterJob:
+        """
+        Create one AdapterJob and wire it to the already-instantiated routed model.
+
+        The dataloader seed is derived from the original global job order, not
+        insertion time, so dynamic arrivals stay reproducible.
+        """
+        offset = self.job_seed_offsets[spec.name]
+        train_loader = build_dataloader(
+            spec.dataset_key,
+            "train",
+            tokenizer=self.tokenizer,
+            batch_size=self.batch_size,
+            max_length=self.max_length,
+            seed=self.seed + offset,
+        )
+        eval_loader = build_dataloader(
+            spec.dataset_key,
+            "validation",
+            tokenizer=self.tokenizer,
+            batch_size=self.batch_size,
+            max_length=self.max_length,
+            seed=self.seed + offset,
+        )
+        adapter_index = self.model.adapter_index[spec.name]
+        optimizer = AdamW(self.model.adapter_parameters(spec.name), lr=self.learning_rate)
+        return AdapterJob(
+            name=spec.name,
+            dataset_key=spec.dataset_key,
+            adapter_index=adapter_index,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            optimizer=optimizer,
+            train_iterator=iter(train_loader),
+            arrival_step=arrival_step,
+            arrival_time_sec=arrival_time_sec,
+        )
+
     def _build_jobs(self, job_specs: list[JobSpec]) -> dict[str, AdapterJob]:
         """
         Create an AdapterJob for each JobSpec.
@@ -565,39 +651,8 @@ class BaselineRunner:
           - An iterator over the training data
         """
         jobs = {}
-        for offset, spec in enumerate(job_specs):
-            # Per-job seed offset: every job gets a deterministic but distinct
-            # shuffle order so that two jobs reading the same dataset don't
-            # train on identical batches in the same step.
-            train_loader = build_dataloader(
-                spec.dataset_key,
-                "train",
-                tokenizer=self.tokenizer,
-                batch_size=self.batch_size,
-                max_length=self.max_length,
-                seed=self.seed + offset,
-            )
-            eval_loader = build_dataloader(
-                spec.dataset_key,
-                "validation",
-                tokenizer=self.tokenizer,
-                batch_size=self.batch_size,
-                max_length=self.max_length,
-                seed=self.seed + offset,
-            )
-            # Look up this adapter's integer index in the RoutedCausalLM.
-            adapter_index = self.model.adapter_index[spec.name]
-            # Create an optimizer that ONLY touches this adapter's LoRA A and B matrices.
-            optimizer = AdamW(self.model.adapter_parameters(spec.name), lr=self.learning_rate)
-            jobs[spec.name] = AdapterJob(
-                name=spec.name,
-                dataset_key=spec.dataset_key,
-                adapter_index=adapter_index,
-                train_loader=train_loader,
-                eval_loader=eval_loader,
-                optimizer=optimizer,
-                train_iterator=iter(train_loader),
-            )
+        for spec in job_specs:
+            jobs[spec.name] = self._build_job(spec)
         return jobs
 
     # -----------------------------------------------------------------------
@@ -614,7 +669,7 @@ class BaselineRunner:
         """Seconds elapsed since this run started (from self.run_start_time)."""
         return time.perf_counter() - self.run_start_time
 
-    def _warmup(self, baseline: str) -> None:
+    def _warmup(self, baseline: str, jobs: list[AdapterJob] | None = None) -> None:
         """
         Run self.warmup_steps un-recorded steps to absorb one-time CUDA costs.
 
@@ -626,26 +681,37 @@ class BaselineRunner:
         if self.warmup_steps <= 0:
             return
 
-        jobs = list(self.jobs.values())
+        jobs = list(jobs or self.jobs.values())
         # Snapshot per-job counters so warmup is invisible to summary metrics.
-        snapshot = [(job.steps_completed, job.tokens_seen, job.completion_time_sec) for job in jobs]
+        snapshot = [
+            (
+                job.steps_completed,
+                job.tokens_seen,
+                job.completion_time_sec,
+                job.first_update_step,
+                job.first_update_time_sec,
+            )
+            for job in jobs
+        ]
 
         if baseline == "sequential" or baseline == "time_sliced":
             # Round-robin warmup steps across jobs so every adapter's LoRA
             # path is exercised at least once before timing begins.
             for warmup_step in range(self.warmup_steps * len(jobs)):
                 self._step_job(jobs[warmup_step % len(jobs)])
-        elif baseline == "fixed_set_simultaneous":
+        elif baseline == "fixed_set_simultaneous" or baseline == "online_insertion":
             for _ in range(self.warmup_steps):
                 self._fused_step(jobs)
         else:
             raise ValueError(f"Unknown baseline for warmup: {baseline}")
 
         # Restore counters so the measured run starts from a clean slate.
-        for job, (steps, tokens, completion) in zip(jobs, snapshot):
+        for job, (steps, tokens, completion, first_update_step, first_update_time) in zip(jobs, snapshot):
             job.steps_completed = steps
             job.tokens_seen = tokens
             job.completion_time_sec = completion
+            job.first_update_step = first_update_step
+            job.first_update_time_sec = first_update_time
 
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(self.device)
@@ -659,6 +725,148 @@ class BaselineRunner:
         """
         if job.completion_time_sec is None and job.steps_completed >= self.train_steps:
             job.completion_time_sec = self._run_elapsed()
+
+    def _mark_job_update(self, job: AdapterJob, global_step: int) -> None:
+        """Record when a job receives its first optimizer update in the measured run."""
+        if job.first_update_step is None:
+            job.first_update_step = global_step
+            job.first_update_time_sec = self._run_elapsed()
+
+    def _default_arrival_steps(self, pending_specs: list[JobSpec]) -> list[int]:
+        """
+        Spread online arrivals across the first train_steps window by default.
+
+        This keeps the existing active set busy before the new job arrives while
+        avoiding a degenerate trace where a job shows up only after everyone else
+        has already finished.
+        """
+        if not pending_specs:
+            return []
+        interval = max(1, self.train_steps // (len(pending_specs) + 1))
+        return [interval * (index + 1) for index in range(len(pending_specs))]
+
+    def _normalize_arrival_plan(
+        self,
+        pending_specs: list[JobSpec],
+        arrival_steps: list[int] | None,
+    ) -> list[tuple[int, JobSpec]]:
+        """Validate and pair pending jobs with their arrival steps."""
+        if not pending_specs:
+            if arrival_steps:
+                raise ValueError("arrival_steps were provided but there are no pending jobs to insert.")
+            return []
+
+        normalized_steps = arrival_steps or self._default_arrival_steps(pending_specs)
+        if len(normalized_steps) != len(pending_specs):
+            raise ValueError(
+                f"Expected {len(pending_specs)} arrival steps for the pending jobs, got {len(normalized_steps)}."
+            )
+        if any(step < 1 for step in normalized_steps):
+            raise ValueError("arrival steps must be positive 1-based fused step numbers.")
+        if any(curr < prev for prev, curr in zip(normalized_steps, normalized_steps[1:])):
+            raise ValueError("arrival steps must be in non-decreasing order.")
+        return list(zip(normalized_steps, pending_specs))
+
+    def _insert_job(self, spec: JobSpec, requested_step: int, active_jobs_before: int) -> AdapterJob:
+        """
+        Hot-plug a new adapter job into the running fused executor.
+
+        This creates the adapter weights inside the routed model, constructs the
+        optimizer and dataloaders, and records insertion timing.
+        """
+        requested_time_sec = self._run_elapsed()
+        insert_start = time.perf_counter()
+        self.model.add_adapter(spec.name)
+        job = self._build_job(spec, arrival_step=requested_step, arrival_time_sec=requested_time_sec)
+        insertion_overhead_sec = time.perf_counter() - insert_start
+        self.jobs[spec.name] = job
+        self.pending_job_specs.pop(spec.name, None)
+        self.insertion_events.append(
+            InsertionEvent(
+                job_name=spec.name,
+                dataset_key=spec.dataset_key,
+                requested_step=requested_step,
+                requested_time_sec=requested_time_sec,
+                insertion_overhead_sec=insertion_overhead_sec,
+                active_jobs_before=active_jobs_before,
+                active_jobs_after=active_jobs_before + 1,
+            )
+        )
+        LOGGER.info(
+            "Inserted adapter name=%s dataset=%s requested_step=%d overhead_sec=%.4f active_jobs=%d->%d",
+            spec.name,
+            spec.dataset_key,
+            requested_step,
+            insertion_overhead_sec,
+            active_jobs_before,
+            active_jobs_before + 1,
+        )
+        return job
+
+    def _finalize_insertion_events(self, step_records: list[dict[str, float]], window: int = 3) -> list[dict[str, object]]:
+        """Attach first-update and disruption metrics to recorded insertion events."""
+        finalized: list[dict[str, object]] = []
+        step_times = {
+            int(record["global_step"]): float(record["step_time_sec"])
+            for record in step_records
+            if "global_step" in record and "step_time_sec" in record
+        }
+
+        for event in self.insertion_events:
+            job = self.jobs.get(event.job_name)
+            if job is not None:
+                event.first_update_step = job.first_update_step
+                event.first_update_time_sec = job.first_update_time_sec
+                if (
+                    event.first_update_time_sec is not None
+                    and event.first_update_time_sec == event.first_update_time_sec
+                ):
+                    event.insertion_to_first_update_sec = event.first_update_time_sec - event.requested_time_sec
+                if event.first_update_step is not None:
+                    event.insertion_to_first_update_steps = event.first_update_step - event.requested_step
+
+            pre_steps = [
+                step_times[step]
+                for step in range(max(1, event.requested_step - window), event.requested_step)
+                if step in step_times
+            ]
+            post_steps = [
+                step_times[step]
+                for step in range(event.requested_step, event.requested_step + window)
+                if step in step_times
+            ]
+            if pre_steps:
+                event.pre_insert_mean_step_time_sec = sum(pre_steps) / len(pre_steps)
+            if post_steps:
+                event.post_insert_mean_step_time_sec = sum(post_steps) / len(post_steps)
+            if (
+                event.pre_insert_mean_step_time_sec is not None
+                and event.pre_insert_mean_step_time_sec > 0
+                and event.post_insert_mean_step_time_sec is not None
+            ):
+                event.step_time_slowdown_ratio = (
+                    event.post_insert_mean_step_time_sec / event.pre_insert_mean_step_time_sec
+                )
+
+            finalized.append(
+                {
+                    "job_name": event.job_name,
+                    "dataset_key": event.dataset_key,
+                    "requested_step": event.requested_step,
+                    "requested_time_sec": event.requested_time_sec,
+                    "insertion_overhead_sec": event.insertion_overhead_sec,
+                    "active_jobs_before": event.active_jobs_before,
+                    "active_jobs_after": event.active_jobs_after,
+                    "first_update_step": event.first_update_step,
+                    "first_update_time_sec": event.first_update_time_sec,
+                    "insertion_to_first_update_sec": event.insertion_to_first_update_sec,
+                    "insertion_to_first_update_steps": event.insertion_to_first_update_steps,
+                    "pre_insert_mean_step_time_sec": event.pre_insert_mean_step_time_sec,
+                    "post_insert_mean_step_time_sec": event.post_insert_mean_step_time_sec,
+                    "step_time_slowdown_ratio": event.step_time_slowdown_ratio,
+                }
+            )
+        return finalized
 
     # -----------------------------------------------------------------------
     # Summary / metrics aggregation
@@ -694,10 +902,46 @@ class BaselineRunner:
         # P95 JCT: with few jobs this is just the max, but named p95 for consistency
         # with how it would be reported at larger scale.
         p95_jct = max(valid_completion_times) if valid_completion_times else None
+        arrival_times = {job.name: float(job.arrival_time_sec) for job in self.jobs.values()}
+        arrival_steps = {job.name: int(job.arrival_step) for job in self.jobs.values()}
+        first_update_times = {
+            job.name: float(job.first_update_time_sec) if job.first_update_time_sec is not None else None
+            for job in self.jobs.values()
+        }
+        completion_since_arrival = {
+            job.name: (
+                float(job.completion_time_sec - job.arrival_time_sec)
+                if job.completion_time_sec is not None
+                else None
+            )
+            for job in self.jobs.values()
+        }
+        valid_completion_since_arrival = [
+            value for value in completion_since_arrival.values() if value is not None
+        ]
+        mean_completion_since_arrival = (
+            sum(valid_completion_since_arrival) / len(valid_completion_since_arrival)
+            if valid_completion_since_arrival
+            else None
+        )
+        p95_completion_since_arrival = (
+            max(valid_completion_since_arrival) if valid_completion_since_arrival else None
+        )
 
         # GPU stats (averaged / maxed across steps).
         gpu_utils = [float(record["gpu_utilization_percent"]) for record in step_records if "gpu_utilization_percent" in record]
         gpu_memory_used = [float(record["gpu_memory_used_mb"]) for record in step_records if "gpu_memory_used_mb" in record]
+        insertion_events = self._finalize_insertion_events(step_records)
+        insertion_latencies = [
+            float(event["insertion_to_first_update_sec"])
+            for event in insertion_events
+            if event["insertion_to_first_update_sec"] is not None
+        ]
+        insertion_slowdowns = [
+            float(event["step_time_slowdown_ratio"])
+            for event in insertion_events
+            if event["step_time_slowdown_ratio"] is not None and not math.isnan(float(event["step_time_slowdown_ratio"]))
+        ]
 
         summary: dict[str, object] = {
             "baseline": baseline_name,
@@ -710,6 +954,13 @@ class BaselineRunner:
             "job_completion_time_sec": completion_times,
             "mean_jct_sec": mean_jct,
             "p95_jct_sec": p95_jct,
+            "job_arrival_time_sec": arrival_times,
+            "job_arrival_step": arrival_steps,
+            "job_first_update_time_sec": first_update_times,
+            "job_completion_since_arrival_sec": completion_since_arrival,
+            "mean_completion_since_arrival_sec": mean_completion_since_arrival,
+            "p95_completion_since_arrival_sec": p95_completion_since_arrival,
+            "insertion_events": insertion_events,
         }
 
         if gpu_utils:
@@ -722,6 +973,13 @@ class BaselineRunner:
         peak_records = [float(record["peak_gpu_memory_mb"]) for record in records if "peak_gpu_memory_mb" in record]
         if peak_records:
             summary["peak_gpu_memory_mb"] = max(peak_records)
+
+        if insertion_latencies:
+            summary["mean_insertion_latency_sec"] = sum(insertion_latencies) / len(insertion_latencies)
+            summary["max_insertion_latency_sec"] = max(insertion_latencies)
+        if insertion_slowdowns:
+            summary["mean_insertion_slowdown_ratio"] = sum(insertion_slowdowns) / len(insertion_slowdowns)
+            summary["max_insertion_slowdown_ratio"] = max(insertion_slowdowns)
 
         summary["training_loss_per_job"] = self._training_loss_per_job(step_records)
 
@@ -760,7 +1018,13 @@ class BaselineRunner:
     # Single training step (used by sequential and time_sliced baselines)
     # -----------------------------------------------------------------------
 
-    def _step_job(self, job: AdapterJob, zero_grad: bool = True, step_optimizer: bool = True) -> dict[str, float]:
+    def _step_job(
+        self,
+        job: AdapterJob,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+        global_step: int | None = None,
+    ) -> dict[str, float]:
         """
         Execute one training step for a single adapter job.
 
@@ -804,6 +1068,8 @@ class BaselineRunner:
         # Update job counters.
         job.steps_completed += 1
         job.tokens_seen += tokens
+        if global_step is not None:
+            self._mark_job_update(job, global_step)
         self._mark_job_completion(job)  # Record JCT if this was the last step
 
         metrics = {
@@ -904,6 +1170,9 @@ class BaselineRunner:
             "device": str(self.device),
             "dataset_keys": [spec.dataset_key for spec in self.job_specs],
             "job_specs": [{"name": spec.name, "dataset_key": spec.dataset_key} for spec in self.job_specs],
+            "initial_job_specs": [
+                {"name": spec.name, "dataset_key": spec.dataset_key} for spec in self.initial_job_specs
+            ],
             "train_steps": self.train_steps,
             "batch_size": self.batch_size,
             "max_length": self.max_length,
@@ -1000,10 +1269,10 @@ class BaselineRunner:
         for index, job in enumerate(self.jobs.values(), start=1):
             self._log_job_start("sequential", job, index, len(self.jobs))
             for local_step in range(self.train_steps):
-                metrics = self._step_job(job)
+                metrics = self._step_job(job, global_step=len(records) + 1)
                 records.append(
                     {
-                        "global_step": len(records),
+                        "global_step": len(records) + 1,
                         "job": job.name,
                         "job_step": local_step + 1,
                         "baseline": "sequential",
@@ -1048,7 +1317,7 @@ class BaselineRunner:
         for global_step in range(total_steps):
             # Round-robin: cycle through jobs.
             job = jobs[global_step % len(jobs)]
-            metrics = self._step_job(job)
+            metrics = self._step_job(job, global_step=global_step + 1)
             records.append(
                 {
                     "global_step": global_step + 1,
@@ -1116,6 +1385,7 @@ class BaselineRunner:
             for job in jobs:
                 job.steps_completed += 1
                 job.tokens_seen += int(per_job_tokens[job.name])
+                self._mark_job_update(job, fused_step + 1)
                 self._mark_job_completion(job)
 
             record = {
@@ -1144,6 +1414,120 @@ class BaselineRunner:
             records.append({"baseline": "fixed_set_simultaneous", "peak_gpu_memory_mb": peak_memory})
         return self._write_results("fixed_set_simultaneous", records)
 
+    # ===================================================================
+    # BASELINE 4: Online insertion (dynamic fused active set)
+    # ===================================================================
+
+    def run_online_insertion(
+        self,
+        initial_job_count: int = 1,
+        arrival_steps: list[int] | None = None,
+    ) -> Path:
+        """
+        Start with a partial active set and hot-plug new adapters mid-run.
+
+        The base model stays live for the whole run. When a new job arrives we:
+          1. Create new LoRA weights inside the routed model
+          2. Build that adapter's optimizer + dataloaders
+          3. Add it to the active set immediately
+          4. Include it in the very next fused step
+
+        Each job still receives self.train_steps optimizer updates in total.
+        Existing jobs continue running during insertions; we never drain the
+        executor, rebuild the model, or restart the run.
+        """
+        if initial_job_count < 1:
+            raise ValueError("initial_job_count must be at least 1.")
+        if initial_job_count > len(self.job_specs):
+            raise ValueError(
+                f"initial_job_count={initial_job_count} exceeds the total number of jobs ({len(self.job_specs)})."
+            )
+
+        records: list[dict[str, float]] = []
+        active_jobs = [self.jobs[spec.name] for spec in self.initial_job_specs[:initial_job_count]]
+        pending_specs = [spec for spec in self.job_specs if spec.name not in {job.name for job in active_jobs}]
+        arrival_plan = self._normalize_arrival_plan(pending_specs, arrival_steps)
+
+        self._warmup("online_insertion", jobs=active_jobs)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self._log_run_header("online_insertion")
+        self.run_start_time = time.perf_counter()
+
+        next_arrival_index = 0
+        fused_step = 0
+        while active_jobs or next_arrival_index < len(arrival_plan):
+            requested_step = fused_step + 1
+            inserted_this_step: list[str] = []
+
+            while (
+                next_arrival_index < len(arrival_plan)
+                and arrival_plan[next_arrival_index][0] == requested_step
+            ):
+                _, spec = arrival_plan[next_arrival_index]
+                job = self._insert_job(spec, requested_step=requested_step, active_jobs_before=len(active_jobs))
+                active_jobs.append(job)
+                inserted_this_step.append(job.name)
+                next_arrival_index += 1
+
+            active_jobs = [job for job in active_jobs if job.steps_completed < self.train_steps]
+            if not active_jobs:
+                # If a malformed arrival plan would leave the executor empty, admit
+                # the next pending job immediately instead of spinning idle.
+                if next_arrival_index < len(arrival_plan):
+                    _, spec = arrival_plan[next_arrival_index]
+                    job = self._insert_job(spec, requested_step=requested_step, active_jobs_before=0)
+                    active_jobs.append(job)
+                    inserted_this_step.append(job.name)
+                    next_arrival_index += 1
+                else:
+                    break
+
+            step = self._fused_step(active_jobs)
+            fused_step = requested_step
+            macro_tokens = step["macro_tokens"]
+            macro_time = step["macro_time"]
+            per_job_tokens = step["per_job_tokens"]
+            per_job_samples = step["per_job_samples"]
+            adapter_losses = step["adapter_losses"]
+
+            for job in active_jobs:
+                job.steps_completed += 1
+                job.tokens_seen += int(per_job_tokens[job.name])
+                self._mark_job_update(job, fused_step)
+                self._mark_job_completion(job)
+
+            record: dict[str, object] = {
+                "global_step": fused_step,
+                "baseline": "online_insertion",
+                "active_jobs": len(active_jobs),
+                "mean_loss": step["loss"],
+                "tokens": macro_tokens,
+                "step_time_sec": macro_time,
+                "tokens_per_sec": float(macro_tokens / macro_time) if macro_time > 0 else 0.0,
+            }
+            if inserted_this_step:
+                record["inserted_jobs"] = ",".join(inserted_this_step)
+                record["inserted_job_count"] = len(inserted_this_step)
+            for job_name, token_count in per_job_tokens.items():
+                record[f"tokens_{job_name}"] = token_count
+            for job_name, sample_count in per_job_samples.items():
+                record[f"samples_{job_name}"] = sample_count
+            for job_name, adapter_loss in adapter_losses.items():
+                record[f"loss_{job_name}"] = adapter_loss
+            snapshot = gpu_snapshot()
+            if snapshot is not None:
+                record.update(snapshot)
+            records.append(record)  # type: ignore[arg-type]
+
+            active_jobs = [job for job in active_jobs if job.steps_completed < self.train_steps]
+
+        self.last_run_wall_time_sec = self._run_elapsed()
+        peak_memory = self._memory_snapshot_mb()
+        if peak_memory is not None:
+            records.append({"baseline": "online_insertion", "peak_gpu_memory_mb": peak_memory})
+        return self._write_results("online_insertion", records)
+
 
 # ===========================================================================
 # Public entry point
@@ -1159,6 +1543,8 @@ def run_baseline(
     warmup_steps: int = DEFAULT_WARMUP_STEPS,
     output_dir: Path = RUNS_DIR,
     run_name: str | None = None,
+    initial_job_count: int = 1,
+    arrival_steps: list[int] | None = None,
 ) -> Path:
     """
     Top-level entry point: parse job entries, build the runner, and execute a baseline.
@@ -1166,17 +1552,22 @@ def run_baseline(
     Called by scripts/run_baseline.py and scripts/run_experiment_family2.py.
 
     Args:
-      baseline    -- One of "sequential", "time_sliced", "fixed_set_simultaneous"
+      baseline    -- One of "sequential", "time_sliced", "fixed_set_simultaneous", "online_insertion"
       job_entries -- List of job strings, e.g. ["ag_news", "emotion"] or ["job1=ag_news", "job2=emotion"]
       train_steps -- Number of training steps per job
       batch_size  -- Samples per batch per job
       max_length  -- Max tokens per sample
       output_dir  -- Directory to write the result JSON
       run_name    -- Optional custom name for the output file (defaults to baseline name)
+      initial_job_count -- For online insertion, how many jobs start active at launch
+      arrival_steps -- For online insertion, 1-based fused step indices when pending jobs arrive
 
     Returns the path to the written JSON results file.
     """
     job_specs = parse_job_specs(job_entries)
+    initial_specs = job_specs
+    if baseline == "online_insertion":
+        initial_specs = job_specs[:initial_job_count]
     runner = BaselineRunner(
         job_specs=job_specs,
         train_steps=train_steps,
@@ -1186,6 +1577,7 @@ def run_baseline(
         warmup_steps=warmup_steps,
         output_dir=output_dir,
         run_name=run_name,
+        initial_job_specs=initial_specs,
     )
     try:
         if baseline == "sequential":
@@ -1194,6 +1586,11 @@ def run_baseline(
             return runner.run_time_sliced()
         if baseline == "fixed_set_simultaneous":
             return runner.run_fixed_set_simultaneous()
+        if baseline == "online_insertion":
+            return runner.run_online_insertion(
+                initial_job_count=initial_job_count,
+                arrival_steps=arrival_steps,
+            )
         raise ValueError(f"Unsupported baseline '{baseline}'.")
     finally:
         runner.release_resources()
